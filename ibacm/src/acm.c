@@ -1118,17 +1118,22 @@ acm_svr_resolve_path(struct acmc_client *client, struct acm_msg *msg)
 
 static int acm_svr_resolve(struct acmc_client *client, struct acm_msg *msg)
 {
+	int ret = 0;
+
 	(void) atomic_inc(&client->refcnt);
 
 	if (msg->resolve_data[0].type == ACM_EP_INFO_PATH) {
 		if (msg->resolve_data[0].flags & ACM_FLAGS_QUERY_SA) {
-			return acm_svr_query_path(client, msg);
+			ret = acm_svr_query_path(client, msg);
 		} else {
-			return acm_svr_resolve_path(client, msg);
+			ret = acm_svr_resolve_path(client, msg);
 		}
 	} else {
-		return acm_svr_resolve_dest(client, msg);
+		ret = acm_svr_resolve_dest(client, msg);
 	}
+
+	free(msg);
+	return ret;
 }
 
 static int acm_svr_perf_query(struct acmc_client *client, struct acm_msg *msg)
@@ -1181,7 +1186,38 @@ static int acm_svr_perf_query(struct acmc_client *client, struct acm_msg *msg)
 	else
 		ret = 0;
 
+	free(msg);
 	return ret;
+}
+
+static int may_be_realloc(struct acm_msg **msg_ptr,
+			int len,
+			int cnt,
+			int *cur_msg_siz_ptr,
+			int max_msg_siz)
+{
+
+	/* Check if a new address exceeds the protocol constrained max size */
+	if (len + (cnt + 1) * ACM_MAX_ADDRESS > max_msg_siz) {
+		acm_log(0, "ERROR - unable to amend more addresses to acm_msg due to protocol constraints\n");
+		return ENOMEM;
+	}
+
+	/* Check if a new address exeeds current size of msg */
+	if (len + (cnt + 1) * ACM_MAX_ADDRESS > *cur_msg_siz_ptr) {
+		const size_t chunk_size = 16 * ACM_MAX_ADDRESS;
+		struct acm_msg *new_msg = realloc(*msg_ptr, *cur_msg_siz_ptr + chunk_size);
+
+		if (!new_msg) {
+			acm_log(0, "ERROR - failed to allocate longer acm_msg\n");
+			return ENOMEM;
+		}
+
+		*msg_ptr = new_msg;
+		*cur_msg_siz_ptr += chunk_size;
+	}
+
+	return 0;
 }
 
 static int acm_svr_ep_query(struct acmc_client *client, struct acm_msg *msg)
@@ -1190,6 +1226,8 @@ static int acm_svr_ep_query(struct acmc_client *client, struct acm_msg *msg)
 	uint16_t len;
 	struct acmc_ep *ep;
 	int index, cnt = 0;
+	int cur_msg_siz = sizeof(*msg);
+	int max_msg_siz = USHRT_MAX;
 
 	acm_log(2, "client %d\n", client->index);
 	index = msg->hdr.data[0];
@@ -1205,6 +1243,8 @@ static int acm_svr_ep_query(struct acmc_client *client, struct acm_msg *msg)
 		len = ACM_MSG_HDR_LENGTH + sizeof(struct acm_ep_config_data);
 		for (i = 0; i < ep->nmbr_ep_addrs; i++) {
 			if (ep->addr_info[i].addr.type != ACM_ADDRESS_INVALID) {
+				if (may_be_realloc(&msg, len, cnt, &cur_msg_siz, max_msg_siz))
+					break;
 				memcpy(msg->ep_data[0].addrs[cnt++].name,
 				       ep->addr_info[i].string_buf,
 				       ACM_MAX_ADDRESS);
@@ -1227,6 +1267,7 @@ static int acm_svr_ep_query(struct acmc_client *client, struct acm_msg *msg)
 	else
 		ret = 0;
 
+	free(msg);
 	return ret;
 }
 
@@ -1238,37 +1279,46 @@ static int acm_msg_length(struct acm_msg *msg)
 
 static void acm_svr_receive(struct acmc_client *client)
 {
-	struct acm_msg msg;
+	struct acm_msg *msg = malloc(sizeof(*msg));
 	int ret;
 
+	if (!msg) {
+		acm_log(0, "ERROR - Unable to alloc acm_msg\n");
+		ret = ENOMEM;
+		goto out;
+	}
+
 	acm_log(2, "client %d\n", client->index);
-	ret = recv(client->sock, (char *) &msg, sizeof msg, 0);
-	if (ret <= 0 || ret != acm_msg_length(&msg)) {
+	ret = recv(client->sock, (char *) msg, sizeof(*msg), 0);
+	if (ret <= 0 || ret != acm_msg_length(msg)) {
 		acm_log(2, "client disconnected\n");
 		ret = ACM_STATUS_ENOTCONN;
-		goto out;
+		goto out_free;
 	}
 
-	if (msg.hdr.version != ACM_VERSION) {
-		acm_log(0, "ERROR - unsupported version %d\n", msg.hdr.version);
-		goto out;
+	if (msg->hdr.version != ACM_VERSION) {
+		acm_log(0, "ERROR - unsupported version %d\n", msg->hdr.version);
+		goto out_free;
 	}
 
-	switch (msg.hdr.opcode & ACM_OP_MASK) {
+	switch (msg->hdr.opcode & ACM_OP_MASK) {
 	case ACM_OP_RESOLVE:
 		atomic_inc(&counter[ACM_CNTR_RESOLVE]);
-		ret = acm_svr_resolve(client, &msg);
-		break;
+		ret = acm_svr_resolve(client, msg);
+		goto out;
 	case ACM_OP_PERF_QUERY:
-		ret = acm_svr_perf_query(client, &msg);
-		break;
+		ret = acm_svr_perf_query(client, msg);
+		goto out;
 	case ACM_OP_EP_QUERY:
-		ret = acm_svr_ep_query(client, &msg);
-		break;
+		ret = acm_svr_ep_query(client, msg);
+		goto out;
 	default:
-		acm_log(0, "ERROR - unknown opcode 0x%x\n", msg.hdr.opcode);
+		acm_log(0, "ERROR - unknown opcode 0x%x\n", msg->hdr.opcode);
 		break;
 	}
+
+out_free:
+	free(msg);
 
 out:
 	if (ret)
@@ -1672,7 +1722,7 @@ static void acm_nl_process_invalid_request(struct acmc_client *client,
 static void acm_nl_process_resolve(struct acmc_client *client,
 				   struct acm_nl_msg *acmnlmsg)
 {
-	struct acm_msg msg;
+	struct acm_msg *msg = malloc(sizeof(*msg));
 	struct nlattr *attr;
 	int payload_len;
 	int resolve_hdr_len;
@@ -1681,21 +1731,26 @@ static void acm_nl_process_resolve(struct acmc_client *client,
 	int status;
 	unsigned char *data;
 
-	memset(&msg, 0, sizeof(msg));
-	msg.hdr.opcode = ACM_OP_RESOLVE;
-	msg.hdr.version = ACM_VERSION;
-	msg.hdr.length = ACM_MSG_HDR_LENGTH + ACM_MSG_EP_LENGTH;
-	msg.hdr.status = ACM_STATUS_SUCCESS;
-	msg.hdr.tid = (uintptr_t) acmnlmsg;
-	msg.resolve_data[0].type = ACM_EP_INFO_PATH;
+	if (!msg) {
+		acm_log(0, "ERROR - Unable to allocate msg\n");
+		return;
+	}
+
+	memset(msg, 0, sizeof(*msg));
+	msg->hdr.opcode = ACM_OP_RESOLVE;
+	msg->hdr.version = ACM_VERSION;
+	msg->hdr.length = ACM_MSG_HDR_LENGTH + ACM_MSG_EP_LENGTH;
+	msg->hdr.status = ACM_STATUS_SUCCESS;
+	msg->hdr.tid = (uintptr_t) acmnlmsg;
+	msg->resolve_data[0].type = ACM_EP_INFO_PATH;
 
 	/* We support only one pathrecord */
 	acm_log(2, "path use 0x%x\n", acmnlmsg->resolve_header.path_use);
 	if (acmnlmsg->resolve_header.path_use ==
 	    LS_RESOLVE_PATH_USE_UNIDIRECTIONAL)
-		msg.resolve_data[0].info.path.reversible_numpath = 1;
+		msg->resolve_data[0].info.path.reversible_numpath = 1;
 	else
-		msg.resolve_data[0].info.path.reversible_numpath =
+		msg->resolve_data[0].info.path.reversible_numpath =
 			IBV_PATH_RECORD_REVERSIBLE | 1;
 
 	data = (unsigned char *) &acmnlmsg->nlmsg_header + NLMSG_HDRLEN;
@@ -1710,7 +1765,7 @@ static void acm_nl_process_resolve(struct acmc_client *client,
 		    attr->nla_len > rem)
 			break;
 
-		status = acm_nl_parse_path_attr(attr, &msg.resolve_data[0]);
+		status = acm_nl_parse_path_attr(attr, &msg->resolve_data[0]);
 		if (status) {
 			acm_nl_process_invalid_request(client, acmnlmsg);
 			return;
@@ -1723,7 +1778,7 @@ static void acm_nl_process_resolve(struct acmc_client *client,
 	}
 
 	atomic_inc(&counter[ACM_CNTR_RESOLVE]);
-	acm_svr_resolve(client, &msg);
+	acm_svr_resolve(client, msg);
 }
 
 static int acm_nl_is_valid_resolve_request(struct acm_nl_msg *acmnlmsg)

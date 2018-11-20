@@ -143,7 +143,7 @@ int acm_if_iter_sys(acm_if_iter_cb cb, void *ctx)
 			return -1;
 	}
 
-	len = sizeof(*ifc) + sizeof(*ifr) * 64;
+	len = sizeof(*ifc) + sizeof(*ifr) * 256;
 	ifc = malloc(len);
 	if (!ifc) {
 		ret = -1;

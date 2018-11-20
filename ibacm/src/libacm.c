@@ -384,11 +384,13 @@ out:
 
 int ib_acm_enum_ep(int index, struct acm_ep_config_data **data)
 {
+	struct acm_ep_config_data *netw_edata = NULL;
+	struct acm_ep_config_data *host_edata = NULL;
 	struct acm_msg msg;
+	struct acm_hdr hdr;
 	int ret;
 	int len;
-	int cnt;
-	struct acm_ep_config_data *edata;
+	int i;
 
 	pthread_mutex_lock(&acm_lock);
 	memset(&msg, 0, sizeof msg);
@@ -401,33 +403,49 @@ int ib_acm_enum_ep(int index, struct acm_ep_config_data **data)
 	if (ret != ACM_MSG_HDR_LENGTH)
 		goto out;
 
-	ret = recv(sock, (char *) &msg, sizeof msg, 0);
-	if (ret < ACM_MSG_HDR_LENGTH || ret != be16toh(msg.hdr.length)) {
+	ret = recv(sock, (char *) &hdr, sizeof(hdr), 0);
+	if (ret != sizeof(hdr)) {
 		ret = ACM_STATUS_EINVAL;
 		goto out;
 	}
 
-	if (msg.hdr.status) {
-		ret = acm_error(msg.hdr.status);
+	if (hdr.status) {
+		ret = acm_error(hdr.status);
 		goto out;
 	}
 
-	cnt = be16toh(msg.ep_data[0].addr_cnt);
-	len = sizeof(struct acm_ep_config_data) +
-		ACM_MAX_ADDRESS * cnt;
-	edata = malloc(len);
-	if (!edata) {
+	len = be16toh(hdr.length) - sizeof(hdr);
+	netw_edata = (struct acm_ep_config_data *)malloc(len);
+	host_edata = (struct acm_ep_config_data *)malloc(len);
+	if (!netw_edata || !host_edata) {
 		ret = ACM_STATUS_ENOMEM;
 		goto out;
 	}
 
-	memcpy(edata, &msg.ep_data[0], len);
-	edata->dev_guid = be64toh(msg.ep_data[0].dev_guid);
-	edata->pkey = be16toh(msg.ep_data[0].pkey);
-	edata->addr_cnt = cnt;
-	*data = edata;
+	ret = recv(sock, (char *)netw_edata, len, 0);
+	if (ret != len) {
+		ret = ACM_STATUS_EINVAL;
+		goto out;
+	}
+
+	host_edata->dev_guid	= be64toh(netw_edata->dev_guid);
+	host_edata->port_num	=         netw_edata->port_num;
+	host_edata->pkey	= be16toh(netw_edata->pkey);
+	host_edata->addr_cnt	= be16toh(netw_edata->addr_cnt);
+
+	memcpy(host_edata->prov_name, netw_edata->prov_name,
+	       sizeof(host_edata->prov_name));
+
+	for (i = 0; i < host_edata->addr_cnt; ++i)
+		host_edata->addrs[i] = netw_edata->addrs[i];
+
+	*data = host_edata;
 	ret = 0;
 out:
+	if (ret)
+		free(host_edata);
+	free(netw_edata);
+
 	pthread_mutex_unlock(&acm_lock);
 	return ret;
 }
