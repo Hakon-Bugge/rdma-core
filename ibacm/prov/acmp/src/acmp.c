@@ -170,6 +170,11 @@ struct acmp_addr {
 	struct acmp_ep        *ep;
 };
 
+struct acmp_addr_ctx {
+	struct acmp_ep	     *ep;
+	int		     addr_inx;
+};
+
 struct acmp_ep {
 	struct acmp_port      *port;
 	struct ibv_cq         *cq;
@@ -190,7 +195,8 @@ struct acmp_ep {
 	struct list_head      active_queue;
 	struct list_head      wait_queue;
 	enum acmp_state       state;
-	struct acmp_addr      addr_info[MAX_EP_ADDR];
+	int		      nmbr_ep_addrs;
+	struct acmp_addr      *addr_info;
 	atomic_t              counters[ACM_MAX_COUNTER];
 };
 
@@ -1046,7 +1052,7 @@ acmp_addr_lookup(struct acmp_ep *ep, uint8_t *addr, uint16_t type)
 {
 	int i;
 
-	for (i = 0; i < MAX_EP_ADDR; i++) {
+	for (i = 0; i < ep->nmbr_ep_addrs; i++) {
 		if (ep->addr_info[i].type != type)
 			continue;
 
@@ -1602,7 +1608,8 @@ acmp_query(void *addr_context, struct acm_msg *msg, uint64_t id)
 {
 	struct acmp_request *req;
 	struct ib_sa_mad *mad;
-	struct acmp_addr *address = addr_context;
+	struct acmp_addr_ctx *addr_ctx = addr_context;
+	struct acmp_addr *address = addr_ctx->ep->addr_info + addr_ctx->addr_inx;
 	struct acmp_ep *ep = address->ep;
 	uint8_t status;
 	struct acm_sa_mad *sa_mad;
@@ -1944,7 +1951,8 @@ put:
 static int
 acmp_resolve(void *addr_context, struct acm_msg *msg, uint64_t id)
 {
-	struct acmp_addr *address = addr_context;
+	struct acmp_addr_ctx *addr_ctx = addr_context;
+	struct acmp_addr *address = addr_ctx->ep->addr_info + addr_ctx->addr_inx;
 	struct acmp_ep *ep = address->ep;
 
 	if (ep->state != ACMP_READY) {
@@ -2365,25 +2373,41 @@ static int acmp_add_addr(const struct acm_address *addr, void *ep_context,
 {
 	struct acmp_ep *ep = ep_context;
 	struct acmp_dest *dest;
+	struct acmp_addr_ctx *addr_ctx;
 	int i;
 
 	acm_log(2, "\n");
 
-	for (i = 0; (i < MAX_EP_ADDR) &&
+	for (i = 0; (i < ep->nmbr_ep_addrs) &&
 	     (ep->addr_info[i].type != ACM_ADDRESS_INVALID); i++)
 		;
 
-	if (i == MAX_EP_ADDR) {
-		acm_log(0, "ERROR - no more space for local address\n");
-		return -1;
+	if (i == ep->nmbr_ep_addrs) {
+		++ep->nmbr_ep_addrs;
+		ep->addr_info = realloc(ep->addr_info, ep->nmbr_ep_addrs * sizeof(*ep->addr_info));
+		if (!ep->addr_info) {
+			--ep->nmbr_ep_addrs;
+			acm_log(0, "ERROR - no more space for local address\n");
+			return -1;
+		}
+		/* Added memory is not initialized */
+		memset(ep->addr_info + i, 0, sizeof(*ep->addr_info));
 	}
 	ep->addr_info[i].type = addr->type;
 	memcpy(&ep->addr_info[i].info, &addr->info, sizeof(addr->info));
 	memcpy(&ep->addr_info[i].addr, addr, sizeof(*addr));
 	ep->addr_info[i].ep = ep;
 
+	addr_ctx = malloc(sizeof(*addr_ctx));
+	if (!addr_ctx) {
+		acm_log(0, "ERROR - unable to alloc address context struct\n");
+		return -1;
+	}
+	addr_ctx->ep = ep;
+	addr_ctx->addr_inx = i;
+
 	if (loopback_prot != ACMP_LOOPBACK_PROT_LOCAL) {
-		*addr_context = &ep->addr_info[i];
+		*addr_context = addr_ctx;
 		return 0;
 	}
 
@@ -2408,7 +2432,7 @@ static int acmp_add_addr(const struct acm_address *addr, void *ep_context,
 	dest->route_timeout = (uint64_t) ~0ULL;
 	dest->state = ACMP_READY;
 	acmp_put_dest(dest);
-	*addr_context = &ep->addr_info[i];
+	*addr_context = addr_ctx;
 	acm_log(1, "added loopback dest %s\n", dest->name);
 
 	return 0;
@@ -2416,7 +2440,8 @@ static int acmp_add_addr(const struct acm_address *addr, void *ep_context,
 
 static void acmp_remove_addr(void *addr_context)
 {
-	struct acmp_addr *address = addr_context;
+	struct acmp_addr_ctx *addr_ctx = addr_context;
+	struct acmp_addr *address = addr_ctx->ep->addr_info + addr_ctx->addr_inx;
 	struct acmp_device *dev;
 	struct acmp_dest *dest;
 	struct acmp_ep *ep;
@@ -2455,6 +2480,7 @@ static void acmp_remove_addr(void *addr_context)
 	pthread_mutex_unlock(&acmp_dev_lock);
 
 	memset(address, 0, sizeof(*address));
+	free(addr_ctx);
 }
 
 static struct acmp_port *acmp_get_port(struct acm_endpoint *endpoint)
