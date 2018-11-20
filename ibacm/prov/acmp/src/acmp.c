@@ -68,7 +68,6 @@
 
 #define IB_LID_MCAST_START 0xc000
 
-#define MAX_EP_ADDR 4
 #define MAX_EP_MC   2
 
 enum acmp_state {
