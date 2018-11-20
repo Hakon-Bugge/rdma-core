@@ -162,7 +162,7 @@ struct acmp_send_queue {
 struct acmp_addr {
 	uint16_t              type;
 	union acm_ep_info     info;
-	struct acm_address    *addr;
+	struct acm_address    addr;
 	struct acmp_ep        *ep;
 };
 
@@ -2375,7 +2375,7 @@ static int acmp_add_addr(const struct acm_address *addr, void *ep_context,
 	}
 	ep->addr_info[i].type = addr->type;
 	memcpy(&ep->addr_info[i].info, &addr->info, sizeof(addr->info));
-	ep->addr_info[i].addr = (struct acm_address *) addr;
+	memcpy(&ep->addr_info[i].addr, addr, sizeof(*addr));
 	ep->addr_info[i].ep = ep;
 
 	if (loopback_prot != ACMP_LOOPBACK_PROT_LOCAL) {
@@ -2435,7 +2435,7 @@ static void acmp_remove_addr(void *addr_context)
 			pthread_mutex_lock(&port->lock);
 			list_for_each(&port->ep_list, ep, entry) {
 				pthread_mutex_unlock(&port->lock);
-				dest = acmp_get_dest(ep, address->type, address->addr->info.addr);
+				dest = acmp_get_dest(ep, address->type, address->addr.info.addr);
 				if (dest) {
 					acm_log(2, "Found a dest addr, deleting it\n");
 					pthread_mutex_lock(&ep->lock);
