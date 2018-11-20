@@ -68,7 +68,6 @@
 #include "acm_mad.h"
 #include "acm_util.h"
 
-#define MAX_EP_ADDR 4
 #define NL_MSG_BUF_SIZE 4096
 #define ACM_PROV_NAME_SIZE 64
 #define NL_CLIENT_INDEX 0
@@ -135,7 +134,10 @@ struct acmc_ep {
 	struct acmc_port      *port;
 	struct acm_endpoint   endpoint;
 	void                  *prov_ep_context;
-	struct acmc_addr      addr_info[MAX_EP_ADDR];
+	/* This lock protects nmbr_ep_addrs and addr_info */
+	pthread_rwlock_t      rwlock;
+	int                   nmbr_ep_addrs;
+	struct acmc_addr      *addr_info;
 	struct list_node      entry;
 };
 
@@ -417,27 +419,34 @@ static void acm_mark_addr_invalid(struct acmc_ep *ep,
 {
 	int i;
 
-	for (i = 0; i < MAX_EP_ADDR; i++) {
+	pthread_rwlock_wrlock(&ep->rwlock);
+	for (i = 0; i < ep->nmbr_ep_addrs; i++) {
 		if (!acm_addr_cmp(&ep->addr_info[i].addr, data->info.addr, data->type)) {
 			ep->addr_info[i].addr.type = ACM_ADDRESS_INVALID;
 			ep->port->prov->remove_address(ep->addr_info[i].prov_addr_context);
 			break;
 		}
 	}
+	pthread_rwlock_unlock(&ep->rwlock);
 }
 
 static struct acm_address *
 acm_addr_lookup(const struct acm_endpoint *endpoint, uint8_t *addr, uint8_t addr_type)
 {
 	struct acmc_ep *ep;
+	struct acm_address *ret = NULL;
 	int i;
 
 	ep = container_of(endpoint, struct acmc_ep, endpoint);
-	for (i = 0; i < MAX_EP_ADDR; i++)
-		if (!acm_addr_cmp(&ep->addr_info[i].addr, addr, addr_type))
-			return &ep->addr_info[i].addr;
+	pthread_rwlock_rdlock(&ep->rwlock);
+	for (i = 0; i < ep->nmbr_ep_addrs; i++)
+		if (!acm_addr_cmp(&ep->addr_info[i].addr, addr, addr_type)) {
+			ret = &ep->addr_info[i].addr;
+			break;
+		}
+	pthread_rwlock_unlock(&ep->rwlock);
 
-	return NULL;
+	return ret;
 }
 
 __be64 acm_path_comp_mask(struct ibv_path_record *path)
@@ -829,6 +838,7 @@ acm_get_port_ep_address(struct acmc_port *port, struct acm_ep_addr_data *data)
 {
 	struct acmc_ep *ep;
 	struct acm_address *addr;
+	struct acmc_addr *caddr = NULL;
 	int i;
 
 	if (port->state != IBV_PORT_ACTIVE)
@@ -842,11 +852,15 @@ acm_get_port_ep_address(struct acmc_port *port, struct acm_ep_addr_data *data)
 		if ((data->type == ACM_EP_INFO_PATH) &&
 		    (!data->info.path.pkey ||
 		     acm_same_partition(be16toh(data->info.path.pkey), ep->endpoint.pkey))) {
-			for (i = 0; i < MAX_EP_ADDR; i++) {
-				if (ep->addr_info[i].addr.type)
-					return &ep->addr_info[i];
+			pthread_rwlock_rdlock(&ep->rwlock);
+			for (i = 0; i < ep->nmbr_ep_addrs; i++) {
+				if (ep->addr_info[i].addr.type) {
+					caddr = &ep->addr_info[i];
+					break;
+				}
 			}
-			return NULL;
+			pthread_rwlock_unlock(&ep->rwlock);
+			return caddr;
 		}
 
 		if ((addr = acm_addr_lookup(&ep->endpoint, data->info.addr,
@@ -1192,12 +1206,46 @@ static int acm_svr_perf_query(struct acmc_client *client, struct acm_msg *msg)
 	return ret;
 }
 
-static int acm_svr_ep_query(struct acmc_client *client, struct acm_msg *msg)
+static int may_be_realloc(struct acm_msg **msg_ptr,
+			  int len,
+			  int cnt,
+			  int *cur_msg_siz_ptr,
+			  int max_msg_siz)
 {
+
+	/* Check if a new address exceeds the protocol constrained max size */
+	if (len + (cnt + 1) * ACM_MAX_ADDRESS > max_msg_siz) {
+		acm_log(0, "ERROR - unable to amend more addresses to acm_msg due to protocol constraints\n");
+			return ENOMEM;
+	}
+
+	/* Check if a new address exeeds current size of msg */
+	if (len + (cnt + 1) * ACM_MAX_ADDRESS > *cur_msg_siz_ptr) {
+		const size_t chunk_size = 16 * ACM_MAX_ADDRESS;
+		struct acm_msg *new_msg = realloc(*msg_ptr, *cur_msg_siz_ptr + chunk_size);
+
+		if (!new_msg) {
+			acm_log(0, "ERROR - failed to allocate longer acm_msg\n");
+			return ENOMEM;
+		}
+
+		*msg_ptr = new_msg;
+		*cur_msg_siz_ptr += chunk_size;
+	}
+
+	return 0;
+}
+
+static int acm_svr_ep_query(struct acmc_client *client, struct acm_msg **_msg)
+{
+	int sts;
 	int ret, i;
 	uint16_t len;
 	struct acmc_ep *ep;
 	int index, cnt = 0;
+	struct acm_msg *msg = *_msg;
+	int cur_msg_siz = sizeof(*msg);
+	int max_msg_siz = USHRT_MAX;
 
 	acm_log(2, "client %d\n", client->index);
 	index = msg->hdr.src_out;
@@ -1212,13 +1260,19 @@ static int acm_svr_ep_query(struct acmc_client *client, struct acm_msg *msg)
 			ACM_MAX_PROV_NAME - 1);
 		msg->ep_data[0].prov_name[ACM_MAX_PROV_NAME - 1] = '\0';
 		len = ACM_MSG_HDR_LENGTH + sizeof(struct acm_ep_config_data);
-		for (i = 0; i < MAX_EP_ADDR; i++) {
+		pthread_rwlock_rdlock(&ep->rwlock);
+		for (i = 0; i < ep->nmbr_ep_addrs; i++) {
 			if (ep->addr_info[i].addr.type != ACM_ADDRESS_INVALID) {
+				sts = may_be_realloc(_msg, len, cnt, &cur_msg_siz, max_msg_siz);
+				msg = *_msg;
+				if (sts)
+					break;
 				memcpy(msg->ep_data[0].addrs[cnt++].name,
 				       ep->addr_info[i].string_buf,
 				       ACM_MAX_ADDRESS);
 			}
 		}
+		pthread_rwlock_unlock(&ep->rwlock);
 		msg->ep_data[0].addr_cnt = htobe16(cnt);
 		len += cnt * ACM_MAX_ADDRESS;
 	} else {
@@ -1247,37 +1301,46 @@ static int acm_msg_length(struct acm_msg *msg)
 
 static void acm_svr_receive(struct acmc_client *client)
 {
-	struct acm_msg msg;
+	struct acm_msg *msg = malloc(sizeof(*msg));
 	int ret;
 
+	if (!msg) {
+		acm_log(0, "ERROR - Unable to alloc acm_msg\n");
+		ret = ENOMEM;
+		goto out;
+	}
+
 	acm_log(2, "client %d\n", client->index);
-	ret = recv(client->sock, (char *) &msg, sizeof msg, 0);
-	if (ret <= 0 || ret != acm_msg_length(&msg)) {
+	ret = recv(client->sock, (char *)msg, sizeof(*msg), 0);
+	if (ret <= 0 || ret != acm_msg_length(msg)) {
 		acm_log(2, "client disconnected\n");
 		ret = ACM_STATUS_ENOTCONN;
-		goto out;
+		goto out_free;
 	}
 
-	if (msg.hdr.version != ACM_VERSION) {
-		acm_log(0, "ERROR - unsupported version %d\n", msg.hdr.version);
-		goto out;
+	if (msg->hdr.version != ACM_VERSION) {
+		acm_log(0, "ERROR - unsupported version %d\n", msg->hdr.version);
+		goto out_free;
 	}
 
-	switch (msg.hdr.opcode & ACM_OP_MASK) {
+	switch (msg->hdr.opcode & ACM_OP_MASK) {
 	case ACM_OP_RESOLVE:
 		atomic_inc(&counter[ACM_CNTR_RESOLVE]);
-		ret = acm_svr_resolve(client, &msg);
+		ret = acm_svr_resolve(client, msg);
 		break;
 	case ACM_OP_PERF_QUERY:
-		ret = acm_svr_perf_query(client, &msg);
+		ret = acm_svr_perf_query(client, msg);
 		break;
 	case ACM_OP_EP_QUERY:
 		ret = acm_svr_ep_query(client, &msg);
 		break;
 	default:
-		acm_log(0, "ERROR - unknown opcode 0x%x\n", msg.hdr.opcode);
+		acm_log(0, "ERROR - unknown opcode 0x%x\n", msg->hdr.opcode);
 		break;
 	}
+
+out_free:
+	free(msg);
 
 out:
 	if (ret)
@@ -1421,11 +1484,13 @@ static int resync_system_ips(void)
 			port = &dev->port[cnt];
 
 			list_for_each(&port->ep_list, ep, entry) {
-				for (i = 0; i < MAX_EP_ADDR; i++) {
+				pthread_rwlock_wrlock(&ep->rwlock);
+				for (i = 0; i < ep->nmbr_ep_addrs; i++) {
 					if (ep->addr_info[i].addr.type == ACM_ADDRESS_IP ||
 					    ep->addr_info[i].addr.type == ACM_ADDRESS_IP6)
 						ep->addr_info[i].addr.type = ACM_ADDRESS_INVALID;
 				}
+				pthread_rwlock_unlock(&ep->rwlock);
 			}
 		}
 	}
@@ -2018,50 +2083,74 @@ static FILE *acm_open_addr_file(void)
 	return fopen(addr_file, "r");
 }
 
+/* rwlock must be held write-locked */
+static int
+__acm_ep_insert_addr(struct acmc_ep *ep, const char *name, uint8_t *addr,
+		   uint8_t addr_type)
+{
+	int i;
+	int ret;
+	uint8_t tmp[ACM_MAX_ADDRESS] = {};
+
+	memcpy(tmp, addr, acm_addr_len(addr_type));
+
+	for (i = 0; (i < ep->nmbr_ep_addrs) &&
+		     (ep->addr_info[i].addr.type != ACM_ADDRESS_INVALID); i++)
+		;
+	if (i == ep->nmbr_ep_addrs) {
+		struct acmc_addr *new_info;
+		new_info = realloc(ep->addr_info, (i + 1) * sizeof(*ep->addr_info));
+		if (!new_info) {
+			ret = ENOMEM;
+			goto out;
+		}
+		ep->addr_info = new_info;
+
+		/* Added memory is not initialized */
+		memset(ep->addr_info + i, 0, sizeof(*ep->addr_info));
+		ep->addr_info[i].addr.endpoint = &ep->endpoint;
+		ep->addr_info[i].addr.id_string = ep->addr_info[i].string_buf;
+		++ep->nmbr_ep_addrs;
+	}
+
+	/* Open the provider endpoint only if at least a name or
+	   address is found */
+	if (!ep->prov_ep_context) {
+		ret = ep->port->prov->open_endpoint(&ep->endpoint,
+						    ep->port->prov_port_context,
+						    &ep->prov_ep_context);
+		if (ret) {
+			acm_log(0, "Error: failed to open prov ep\n");
+			goto out;
+		}
+	}
+	ep->addr_info[i].addr.type = addr_type;
+	strncpy(ep->addr_info[i].string_buf, name, ACM_MAX_ADDRESS);
+	memcpy(ep->addr_info[i].addr.info.addr, tmp, ACM_MAX_ADDRESS);
+	ret = ep->port->prov->add_address(&ep->addr_info[i].addr,
+					  ep->prov_ep_context,
+					  &ep->addr_info[i].prov_addr_context);
+	if (ret) {
+		acm_log(0, "Error: failed to add addr to provider\n");
+		ep->addr_info[i].addr.type = ACM_ADDRESS_INVALID;
+	}
+
+out:
+	return ret;
+}
+
 static int
 acm_ep_insert_addr(struct acmc_ep *ep, const char *name, uint8_t *addr,
 		   uint8_t addr_type)
 {
-	int i, ret = -1;
-	uint8_t tmp[ACM_MAX_ADDRESS];
-
-	memset(tmp, 0, sizeof tmp);
-	memcpy(tmp, addr, acm_addr_len(addr_type));
+	int ret = -1;
 
 	if (!acm_addr_lookup(&ep->endpoint, addr, addr_type)) {
-		for (i = 0; (i < MAX_EP_ADDR) &&
-			    (ep->addr_info[i].addr.type != ACM_ADDRESS_INVALID); i++)
-			;
-		if (i == MAX_EP_ADDR) {
-			ret = ENOMEM;
-			goto out;
-		}
-
-		/* Open the provider endpoint only if at least a name or
-		   address is found */
-		if (!ep->prov_ep_context) {
-			ret = ep->port->prov->open_endpoint(&ep->endpoint,
-				ep->port->prov_port_context,
-				&ep->prov_ep_context);
-			if (ret) {
-				acm_log(0, "Error: failed to open prov ep\n");
-				goto out;
-			}
-		}
-		ep->addr_info[i].addr.type = addr_type;
-		strncpy(ep->addr_info[i].string_buf, name, ACM_MAX_ADDRESS);
-		memcpy(ep->addr_info[i].addr.info.addr, tmp, ACM_MAX_ADDRESS);
-		ret = ep->port->prov->add_address(&ep->addr_info[i].addr,
-						  ep->prov_ep_context,
-						  &ep->addr_info[i].prov_addr_context);
-		if (ret) {
-			acm_log(0, "Error: failed to add addr to provider\n");
-			ep->addr_info[i].addr.type = ACM_ADDRESS_INVALID;
-			goto out;
-		}
+		pthread_rwlock_wrlock(&ep->rwlock);
+		ret = __acm_ep_insert_addr(ep, name, addr, addr_type);
+		pthread_rwlock_unlock(&ep->rwlock);
 	}
-	ret = 0;
-out:
+
 	return ret;
 }
 
@@ -2121,6 +2210,7 @@ static int acm_assign_ep_names(struct acmc_ep *ep)
 	uint16_t pkey;
 	uint8_t addr[ACM_MAX_ADDRESS], type;
 	int port;
+	int ret;
 
 	dev_name = ep->port->dev->device.verbs->device->name;
 	acm_log(1, "device %s, port %d, pkey 0x%x\n",
@@ -2180,7 +2270,11 @@ static int acm_assign_ep_names(struct acmc_ep *ep)
 	fclose(faddr);
 
 out:
-	return (ep->addr_info[0].addr.type == ACM_ADDRESS_INVALID);
+	pthread_rwlock_rdlock(&ep->rwlock);
+	ret = (!ep->nmbr_ep_addrs || ep->addr_info[0].addr.type == ACM_ADDRESS_INVALID);
+	pthread_rwlock_unlock(&ep->rwlock);
+
+	return ret;
 }
 
 static struct acmc_ep *acm_find_ep(struct acmc_port *port, uint16_t pkey)
@@ -2205,7 +2299,9 @@ static void acm_ep_down(struct acmc_ep *ep)
 	acm_log(1, "%s %d pkey 0x%04x\n",
 		ep->port->dev->device.verbs->device->name,
 		ep->port->port.port_num, ep->endpoint.pkey);
-	for (i = 0; i < MAX_EP_ADDR; i++) {
+
+	pthread_rwlock_wrlock(&ep->rwlock);
+	for (i = 0; i < ep->nmbr_ep_addrs; i++) {
 		if (ep->addr_info[i].addr.type &&
 		    ep->addr_info[i].prov_addr_context)
 			ep->port->prov->remove_address(ep->addr_info[i].
@@ -2215,6 +2311,8 @@ static void acm_ep_down(struct acmc_ep *ep)
 	if (ep->prov_ep_context)
 		ep->port->prov->close_endpoint(ep->prov_ep_context);
 
+	pthread_rwlock_unlock(&ep->rwlock);
+	pthread_rwlock_destroy(&ep->rwlock);
 	free(ep);
 }
 
@@ -2222,7 +2320,6 @@ static struct acmc_ep *
 acm_alloc_ep(struct acmc_port *port, uint16_t pkey)
 {
 	struct acmc_ep *ep;
-	int i;
 
 	acm_log(1, "\n");
 	ep = calloc(1, sizeof *ep);
@@ -2232,11 +2329,12 @@ acm_alloc_ep(struct acmc_port *port, uint16_t pkey)
 	ep->port = port;
 	ep->endpoint.port = &port->port;
 	ep->endpoint.pkey = pkey;
-
-	for (i = 0; i < MAX_EP_ADDR; i++) {
-		ep->addr_info[i].addr.endpoint = &ep->endpoint;
-		ep->addr_info[i].addr.id_string = ep->addr_info[i].string_buf;
+	if (pthread_rwlock_init(&ep->rwlock, NULL)) {
+		free(ep);
+		return NULL;
 	}
+	ep->addr_info = NULL;
+	ep->nmbr_ep_addrs = 0;
 
 	return ep;
 }
